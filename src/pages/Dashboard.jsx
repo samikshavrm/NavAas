@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   Activity,
   AlertTriangle,
@@ -13,10 +13,91 @@ import {
   Wind,
 } from 'lucide-react'
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+
 import { useSensorData } from '../hooks/useSensorData'
+
+// Person 3's modules — the Ask, Reassess, Safety, and SOS pipeline
+import { getQuestionForAlert, RESPONSES } from '../ask/index.js'
+import { runResponseSession, speakText } from '../response/index.js'
+import { reassessRisk } from '../reassessment/index.js'
+import { getSafetyActions } from '../safety/index.js'
+import { shouldActivateSOS, createSOSController } from '../sos/index.js'
+
+// ── Sound + vibration helpers ────────────────────────────────────────────────
+// Built with the Web Audio API so no external sound file is needed — this
+// works fully offline, matching the "no internet dependency" requirement.
+// Both are safe no-ops on browsers/devices that don't support them (e.g. a
+// laptop won't vibrate, it'll just skip that part silently).
+
+function playTone({ frequency = 880, durationMs = 150, type = 'sine', volume = 0.2 } = {}) {
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext
+    if (!AudioContextClass) return
+    const ctx = new AudioContextClass()
+    const oscillator = ctx.createOscillator()
+    const gain = ctx.createGain()
+    oscillator.type = type
+    oscillator.frequency.value = frequency
+    gain.gain.value = volume
+    oscillator.connect(gain)
+    gain.connect(ctx.destination)
+    oscillator.start()
+    setTimeout(() => {
+      oscillator.stop()
+      ctx.close()
+    }, durationMs)
+  } catch (_) {
+    // Audio not supported/allowed — fail silently, never block the app.
+  }
+}
+
+/** Urgent double-beep played the instant an SOS countdown begins. */
+function playSOSStartSound() {
+  playTone({ frequency: 950, durationMs: 140, type: 'square', volume: 0.22 })
+  setTimeout(() => playTone({ frequency: 950, durationMs: 140, type: 'square', volume: 0.22 }), 220)
+}
+
+/** Softer single "ding" played when the notification is confirmed sent. */
+function playNotificationSentSound() {
+  playTone({ frequency: 1200, durationMs: 180, type: 'sine', volume: 0.18 })
+}
+
+function vibrate(pattern) {
+  if (typeof navigator !== 'undefined' && navigator.vibrate) {
+    navigator.vibrate(pattern)
+  }
+}
+
+/**
+ * Speaks a single countdown number quickly (e.g. "30", "29", "28"...).
+ * Cancels any number still being spoken before starting the next one, so
+ * numbers don't pile up or overlap if speech is slightly slower than 1s.
+ */
+function speakCountdownNumber(number) {
+  try {
+    if (!window.speechSynthesis) return
+    window.speechSynthesis.cancel()
+    const utterance = new SpeechSynthesisUtterance(String(number))
+    utterance.rate = 1.15
+    utterance.pitch = 1
+    utterance.volume = 1
+    window.speechSynthesis.speak(utterance)
+  } catch (_) {
+    // Speech not supported — fail silently, countdown still works visually.
+  }
+}
 
 function statusFor(level) {
   return level === 'LOW' ? 'normal' : level === 'MODERATE' ? 'warning' : 'critical'
+}
+
+// Human-readable labels for each RESPONSES constant, used on the alert buttons.
+const RESPONSE_LABELS = {
+  [RESPONSES.UNWELL]: 'YES, UNWELL',
+  [RESPONSES.BREATHING_DIFFICULTY]: 'YES, DIFFICULTY',
+  [RESPONSES.HELP]: 'HELP',
+  [RESPONSES.FINE]: "I'M FINE",
+  [RESPONSES.OKAY]: "I'M OKAY",
 }
 
 export function SensorCard({ icon: IconComponent, label, value, unit, status = 'normal' }) {
@@ -48,15 +129,15 @@ export function AlertScreen({ alertType, reason, questionText, secondsRemaining,
       </div>
       <p className="countdown-copy"><strong>{secondsRemaining}</strong> seconds remaining</p>
       <div className="alert-actions">
-        {buttonLabels.map((label) => (
-          <button key={label} onClick={() => onButtonPress?.(label)}>{label}</button>
+        {buttonLabels.map(({ label, value }) => (
+          <button key={value} onClick={() => onButtonPress?.(value)}>{label}</button>
         ))}
       </div>
     </section>
   )
 }
 
-export function SafetyActionScreen({ riskType, instructions, onSOSPress }) {
+export function SafetyActionScreen({ riskType, instructions, onSOSPress, onResumeMonitoring }) {
   return (
     <section className="safety-screen">
       <div className="safety-banner">
@@ -75,12 +156,19 @@ export function SafetyActionScreen({ riskType, instructions, onSOSPress }) {
           ))}
         </div>
         <button className="sos-button" onClick={onSOSPress}>TRIGGER SOS <AlertTriangle /></button>
+        <button
+          onClick={onResumeMonitoring}
+          style={{ marginTop: 10, width: '100%', minHeight: 44, background: 'transparent', color: '#9aaab0', border: '1px solid rgba(255,255,255,.15)', borderRadius: 10, fontSize: 11, fontWeight: 700 }}
+        >
+          RESUME MONITORING
+        </button>
       </div>
     </section>
   )
 }
 
-export function SOSCountdownScreen({ secondsRemaining, condition, location, contact, onCancel, isComplete }) {
+export function SOSCountdownScreen({ secondsRemaining, condition, location, contact, onCancel, isComplete, onResumeMonitoring }) {
+  const sentAt = isComplete ? new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : null
   return (
     <section className={`sos-screen ${isComplete ? 'sos-complete' : ''}`}>
       {isComplete ? (
@@ -88,7 +176,19 @@ export function SOSCountdownScreen({ secondsRemaining, condition, location, cont
           <div className="complete-icon"><Check /></div>
           <p className="eyebrow">SIMULATION STATUS</p>
           <h2>SOS SIMULATION COMPLETE</h2>
-          <p className="sos-subtitle">No emergency dispatch was made.</p>
+          <p className="sos-subtitle">No real emergency dispatch was made — this is a demo confirmation.</p>
+          <div className="sos-meta" style={{ marginTop: 20, textAlign: 'left' }}>
+            <p style={{ color: '#9dcac2', fontWeight: 700 }}><Check style={{ width: 13 }} /> Notification sent to: {contact}</p>
+            <p><MapPin /> Location shared: {location}</p>
+            <p><CircleHelp /> Reason: {condition}</p>
+            <p>Sent at: {sentAt}</p>
+          </div>
+          <button
+            onClick={onResumeMonitoring}
+            style={{ marginTop: 24, minHeight: 48, padding: '0 20px', background: 'rgba(255,255,255,.08)', color: '#d8f6eb', border: '1px solid rgba(255,255,255,.2)', borderRadius: 10, fontSize: 11, fontWeight: 700 }}
+          >
+            RETURN TO DASHBOARD
+          </button>
         </>
       ) : (
         <>
@@ -106,6 +206,43 @@ export function SOSCountdownScreen({ secondsRemaining, condition, location, cont
         </>
       )}
     </section>
+  )
+}
+
+// A slide-down notification banner that mimics a phone SMS/push notification,
+// used to visually confirm "the emergency contact was just notified" the
+// moment the SOS simulation completes.
+export function SMSNotificationToast({ visible, message }) {
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        top: visible ? 32 : -140,
+        left: 10,
+        right: 10,
+        zIndex: 50,
+        transition: 'top 0.45s cubic-bezier(0.34, 1.56, 0.64, 1)',
+        background: 'rgba(18,26,30,0.97)',
+        border: '1px solid rgba(255,255,255,.14)',
+        borderRadius: 16,
+        padding: '11px 12px',
+        display: 'flex',
+        gap: 10,
+        alignItems: 'flex-start',
+        boxShadow: '0 12px 34px rgba(0,0,0,.5)',
+      }}
+    >
+      <div style={{ width: 30, height: 30, borderRadius: 8, background: '#d94c58', display: 'grid', placeItems: 'center', flexShrink: 0 }}>
+        <AlertTriangle style={{ width: 15, color: '#fff' }} />
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+          <strong style={{ fontSize: 11, color: '#fff' }}>Emergency SOS</strong>
+          <span style={{ fontSize: 8, color: '#8a9a9d', flexShrink: 0, marginLeft: 6 }}>now</span>
+        </div>
+        <p style={{ margin: '3px 0 0', fontSize: 10, color: '#c9d7d6', lineHeight: 1.4 }}>{message}</p>
+      </div>
+    </div>
   )
 }
 
@@ -168,7 +305,7 @@ function HistoryChart({ history }) {
   )
 }
 
-function Dashboard({ sensorData, riskResult, history, onAlert }) {
+function Dashboard({ sensorData, riskResult, history }) {
   const riskLevel = riskResult.riskLevel
   const riskCopy = { LOW: 'YOU ARE SAFE', MODERATE: 'STAY ALERT', HIGH: 'ACTION NEEDED', CRITICAL: 'EMERGENCY RISK' }[riskLevel] || 'MONITORING'
   const status = statusFor(riskLevel)
@@ -194,7 +331,6 @@ function Dashboard({ sensorData, riskResult, history, onAlert }) {
       </div>
       <div className="today-heading">
         <div><p className="eyebrow">TODAY&apos;S HEALTH</p><h2>Signal history</h2></div>
-        <button onClick={onAlert} aria-label="Preview alert"><AlertTriangle /></button>
       </div>
       <HistoryChart history={history} />
     </div>
@@ -206,23 +342,147 @@ export default function Page() {
   const [activeScenario, setActiveScenario] = useState('BASELINE')
   const [heartRateHistory, setHeartRateHistory] = useState([])
 
-  // Keep a rolling window of the last 20 heart-rate readings for the chart.
-  // This runs every time a new sensor packet arrives (sensorData.timestamp
-  // changes), which is the correct React way to react to prop/state changes
-  // — no timers or in-render state updates needed.
+  // Screen state machine: what the phone screen currently shows.
+  // 'DASHBOARD' -> 'ASKING' -> 'SAFETY' or 'SOS' -> back to 'DASHBOARD'
+  const [screen, setScreen] = useState('DASHBOARD')
+  const [questionState, setQuestionState] = useState(null) // { detectionResult, questionConfig, secondsRemaining }
+  const [safetyState, setSafetyState] = useState(null) // { severity, instructions }
+  const [sosState, setSosState] = useState(null) // { remainingSeconds, alertType, reason, location, emergencyContact, status }
+  const [showNotificationToast, setShowNotificationToast] = useState(false)
+
+  // Holds the "resolve" function for the promise the response session is
+  // waiting on. Clicking a button calls this to resolve the user's answer.
+  const responseResolverRef = useRef(null)
+  const sosControllerRef = useRef(null)
+  // Remembers which alertType we've already asked about, so a still-ongoing
+  // HEATWAVE/RESPIRATORY reading (which keeps re-detecting every ~1.5s) doesn't
+  // trigger the question again the instant we return to the dashboard.
+  const askedForAlertTypeRef = useRef(null)
+
+  // Track heart-rate history for the chart — runs once per new sensor packet.
   useEffect(() => {
     setHeartRateHistory((prev) => {
-      const next = [
-        ...prev,
-        { timestamp: String(prev.length + 1), heartRate: sensorData.heartRate },
-      ]
-      return next.slice(-20) // keep only the last 20 points
+      const next = [...prev, { timestamp: String(prev.length + 1), heartRate: sensorData.heartRate }]
+      return next.slice(-20)
     })
   }, [sensorData.timestamp])
 
-  const showAlert = riskResult.alertType !== null && riskResult.riskLevel !== 'LOW'
+  // Whenever the detection engine reports a new alert (and we're not
+  // already handling one, and we haven't already asked about this exact
+  // alert type), kick off the Ask -> Reassess -> Act flow.
+  useEffect(() => {
+    if (screen !== 'DASHBOARD') return // already mid-flow, don't retrigger
+    if (!riskResult.alertType) return // no alert right now
+    if (riskResult.riskLevel === 'LOW') return // nothing to ask about
+    if (askedForAlertTypeRef.current === riskResult.alertType) return // already asked for this ongoing alert
+
+    askedForAlertTypeRef.current = riskResult.alertType
+    startAlertFlow(riskResult)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [riskResult.alertType, riskResult.riskLevel, screen])
+
+  async function startAlertFlow(detectionResult) {
+    const questionConfig = getQuestionForAlert(detectionResult)
+    setScreen('ASKING')
+    setQuestionState({ detectionResult, questionConfig, secondsRemaining: 15 })
+
+    // Speak the question aloud (safe no-op if browser doesn't support it)
+    speakText(questionConfig.question)
+
+    // waitForUserResponse() returns a promise that resolves when a button
+    // is clicked. We stash the resolver so the button's onClick can call it.
+    const waitForUserResponse = () =>
+      new Promise((resolve) => {
+        responseResolverRef.current = resolve
+      })
+
+    const { response } = await runResponseSession(questionConfig, waitForUserResponse, {
+      onTick: (remainingMs) => {
+        setQuestionState((prev) => (prev ? { ...prev, secondsRemaining: Math.ceil(remainingMs / 1000) } : prev))
+      },
+    })
+
+    responseResolverRef.current = null
+
+    // Combine sensor evidence + user response into a final risk decision.
+    const reassessment = reassessRisk(detectionResult, response)
+    const safety = getSafetyActions(reassessment, detectionResult.alertType)
+
+    if (shouldActivateSOS(reassessment, safety)) {
+      beginSOS(reassessment, safety)
+    } else if (reassessment.finalRiskLevel === 'HIGH') {
+      // Only HIGH gets the full-screen safety checklist takeover.
+      // LOW/MODERATE (e.g. user said "I'm fine" but sensors still show
+      // mild risk) just returns to the dashboard, where the risk banner
+      // already reflects the ongoing MODERATE/warning state in color.
+      setSafetyState({ severity: reassessment.finalRiskLevel, instructions: safety.instructions })
+      setScreen('SAFETY')
+    } else {
+      setScreen('DASHBOARD')
+    }
+  }
+
+  function handleAlertButtonPress(responseValue) {
+    responseResolverRef.current?.(responseValue)
+  }
+
+  function beginSOS(reassessment, safety) {
+    setScreen('SOS')
+    // Urgent alert cue the instant the countdown begins.
+    playSOSStartSound()
+    vibrate([200, 100, 200, 100, 200])
+
+    const controller = createSOSController({
+      alertType: safety.alertType,
+      reason: reassessment.reason,
+      onTick: (state) => {
+        setSosState({ ...state, isComplete: false })
+        speakCountdownNumber(state.remainingSeconds) // voice: "29", "28", "27"...
+      },
+      onComplete: (state) => {
+        setSosState({ ...state, isComplete: true })
+        // Confirmation cue the instant the notification is "sent".
+        playNotificationSentSound()
+        vibrate([80])
+        setShowNotificationToast(true)
+        setTimeout(() => setShowNotificationToast(false), 4500)
+      },
+      onCancel: () => resetToDashboard(),
+    })
+    sosControllerRef.current = controller
+    const initialState = controller.getState()
+    setSosState({ ...initialState, isComplete: false })
+    speakCountdownNumber(initialState.remainingSeconds) // voice: "30" (the very first number)
+    controller.start()
+  }
+
+  function handleManualSOSFromSafety() {
+    const reassessment = { finalRiskLevel: 'CRITICAL', reason: safetyState?.severity ? `${safetyState.severity} risk — manual SOS trigger` : 'Manual SOS trigger' }
+    const safety = { alertType: questionState?.detectionResult?.alertType ?? 'UNKNOWN', triggerSOS: true }
+    beginSOS(reassessment, safety)
+  }
+
+  function handleSOSCancel() {
+    if (window.speechSynthesis) window.speechSynthesis.cancel() // stop any mid-countdown number immediately
+    sosControllerRef.current?.cancel()
+    resetToDashboard()
+  }
+
+  function resetToDashboard() {
+    sosControllerRef.current = null
+    askedForAlertTypeRef.current = null
+    setScreen('DASHBOARD')
+    setQuestionState(null)
+    setSafetyState(null)
+    setSosState(null)
+    setShowNotificationToast(false)
+    setScenario('BASELINE')
+    setActiveScenario('BASELINE')
+  }
 
   function handleScenarioSelect(scenario) {
+    resetToDashboard()
+    askedForAlertTypeRef.current = null
     setActiveScenario(scenario)
     setScenario(scenario)
   }
@@ -239,19 +499,10 @@ export default function Page() {
     movement: sensorData.movement ? 'Stable' : 'Still',
   }
 
-  const alertTypeToQuestion = {
-    HEAT: 'Are you feeling dizzy or unusually tired?',
-    RESPIRATORY: 'Are you experiencing shortness of breath?',
-    FALL: 'Do you need immediate assistance?',
-  }
-  const alertTypeToButtons = {
-    HEAT: ['YES, UNWELL', "I'M FINE"],
-    RESPIRATORY: ['YES, UNWELL', "I'M FINE"],
-    FALL: ['HELP', "I'M OKAY"],
-  }
+  const isAlertActive = screen !== 'DASHBOARD'
 
   return (
-    <main className={`app-shell ${showAlert ? 'alert-active' : ''}`}>
+    <main className={`app-shell ${isAlertActive ? 'alert-active' : ''}`}>
       <DemoController
         activeScenario={activeScenario}
         onScenarioSelect={handleScenarioSelect}
@@ -263,23 +514,50 @@ export default function Page() {
           <div className="phone-screen">
             <div className="phone-notch"><span /></div>
             <div className="phone-status"><span>9:41</span><span>▮▮▮　⌁　▰</span></div>
-            {showAlert ? (
+
+            <SMSNotificationToast
+              visible={showNotificationToast}
+              message={sosState ? `Message sent to ${sosState.emergencyContact}: "Emergency detected — ${sosState.reason}. Location: ${sosState.location}"` : ''}
+            />
+
+            {screen === 'ASKING' && questionState && (
               <AlertScreen
-                alertType={riskResult.alertType}
-                reason={riskResult.reason}
-                questionText={alertTypeToQuestion[riskResult.alertType] || 'Please confirm your condition.'}
-                secondsRemaining={15}
-                buttonLabels={alertTypeToButtons[riskResult.alertType] || ['YES', 'NO']}
-                onButtonPress={() => setScenario('BASELINE')}
-              />
-            ) : (
-              <Dashboard
-                sensorData={sensorData}
-                riskResult={riskResult}
-                history={heartRateHistory}
-                onAlert={() => {}}
+                alertType={questionState.detectionResult.alertType}
+                reason={questionState.detectionResult.reason}
+                questionText={questionState.questionConfig.question}
+                secondsRemaining={questionState.secondsRemaining}
+                buttonLabels={questionState.questionConfig.responses
+                  .filter((r) => r !== RESPONSES.NO_RESPONSE) // NO_RESPONSE is automatic via timeout, not a button
+                  .map((r) => ({ value: r, label: RESPONSE_LABELS[r] || r }))}
+                onButtonPress={handleAlertButtonPress}
               />
             )}
+
+            {screen === 'SAFETY' && safetyState && (
+              <SafetyActionScreen
+                riskType={safetyState.severity}
+                instructions={safetyState.instructions}
+                onSOSPress={handleManualSOSFromSafety}
+                onResumeMonitoring={resetToDashboard}
+              />
+            )}
+
+            {screen === 'SOS' && sosState && (
+              <SOSCountdownScreen
+                secondsRemaining={sosState.remainingSeconds}
+                condition={sosState.alertType}
+                location={sosState.location}
+                contact={sosState.emergencyContact}
+                isComplete={sosState.isComplete}
+                onCancel={handleSOSCancel}
+                onResumeMonitoring={resetToDashboard}
+              />
+            )}
+
+            {screen === 'DASHBOARD' && (
+              <Dashboard sensorData={sensorData} riskResult={riskResult} history={heartRateHistory} />
+            )}
+
             <div className="phone-home" />
           </div>
         </div>
